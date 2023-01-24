@@ -69,12 +69,12 @@ let maybe_build_bubblewrap_from_source ?(prefix = "/usr/local") distro =
            rel prefix
       @@ run "rm -rf %s bubblewrap-%s" file rel
 
-let bubblewrap_and_dev_packages distro =
+let bubblewrap_and_dev_packages ?clean distro =
   let dev_packages =
     match D.package_manager distro with
     | `Apk -> Linux.Apk.dev_packages
     | `Apt -> Linux.Apt.dev_packages
-    | `Yum -> Linux.RPM.dev_packages
+    | `Yum -> Linux.RPM.dev_packages ?clean
     | `Zypper -> Linux.Zypper.dev_packages
     | `Pacman -> Linux.Pacman.dev_packages
     | `Cygwin | `Windows -> assert false
@@ -282,7 +282,7 @@ let apt_opam2 ?(labels = []) ?arch distro ~opam_hashes () =
 
    [enable_powertools] enables the PowerTools repository on CentOS 8 and above.
    This is needed to get most of *-devel packages frequently used by opam packages. *)
-let yum_opam2 ?(labels = []) ?arch ~yum_workaround ~enable_powertools
+let yum_opam2 ?(labels = []) ?arch ?clean ~yum_workaround ~enable_powertools
     ~opam_hashes distro () =
   let opam_master_hash, opam_branches = create_opam_branches opam_hashes in
   let workaround =
@@ -294,14 +294,15 @@ let yum_opam2 ?(labels = []) ?arch ~yum_workaround ~enable_powertools
   @@ label (("distro_style", "rpm") :: labels)
   @@ run "yum --version || dnf install -y yum"
   @@ workaround @@ Linux.RPM.update
-  @@ Linux.RPM.dev_packages ~extra:"which tar curl xz libcap-devel openssl" ()
+  @@ Linux.RPM.dev_packages ?clean
+       ~extra:"which tar curl xz libcap-devel openssl" ()
   @@ Linux.Git.init ()
   @@ maybe_build_bubblewrap_from_source distro
   @@ install_opams ~prefix:"/usr" opam_master_hash opam_branches
   @@ from ?arch distro
   @@ run "yum --version || dnf install -y yum"
   @@ workaround @@ Linux.RPM.update
-  @@ bubblewrap_and_dev_packages distro
+  @@ bubblewrap_and_dev_packages ?clean distro
   @@ copy_opams ~src:"/usr/bin" ~dst:"/usr/bin" opam_branches
   @@ (if enable_powertools then
       run "yum config-manager --set-enabled powertools" @@ Linux.RPM.update
