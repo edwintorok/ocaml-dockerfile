@@ -62,12 +62,76 @@ type healthcheck_options = {
 type healthcheck = [ `Cmd of healthcheck_options * shell_or_exec | `None ]
 [@@deriving sexp]
 
+module StringMap = Map.Make (String)
+
+type +'a map = 'a StringMap.t
+
+let sexp_of_map sexp_of_e t =
+  t |> StringMap.bindings
+  |> sexp_of_list @@ sexp_of_pair sexp_of_string sexp_of_e
+
+let map_of_sexp e_of_sexp sexp =
+  sexp
+  |> list_of_sexp @@ pair_of_sexp string_of_sexp e_of_sexp
+  |> List.to_seq |> StringMap.of_seq
+
+module MountOptions = struct
+  type t = { mount_type : string; options : string map } [@@deriving sexp]
+
+  let v ~mount_type options = { mount_type; options }
+  let invalid = { mount_type = ""; options = StringMap.empty }
+
+  let equal a b =
+    a.mount_type = b.mount_type
+    && StringMap.equal String.equal a.options b.options
+
+  let is_valid t = not @@ equal t invalid
+
+  let to_string (target, t) =
+    t.options
+    |> StringMap.add "target" target
+    |> StringMap.bindings
+    |> List.map (fun (k, v) -> k ^ "=" ^ v)
+    |> String.concat ","
+    |> Printf.sprintf "--mount=type=%s,%s" t.mount_type
+
+  type from_source = string option * string
+  type sharing = Shared | Locked
+
+  let string_of_sharing = function Shared -> "shared" | Locked -> "locked"
+
+  let add_option name optval options =
+    match optval with None -> options | Some v -> StringMap.add name v options
+
+  let bind ?(options = StringMap.empty) ?rw ~from_source:(from, source) () =
+    options
+    |> add_option "source" (Some source)
+    |> add_option "from" from
+    |> add_option "rw" (Option.map string_of_bool rw)
+    |> v ~mount_type:"bind"
+
+  let cache ?(options = StringMap.empty) ?id ?ro ?sharing ?from_source ?mode
+      ?uid ?gid () =
+    options |> add_option "id" id
+    |> add_option "ro" (Option.map string_of_bool ro)
+    |> add_option "sharing" (Option.map string_of_sharing sharing)
+    |> add_option "from" (Option.map fst from_source |> Option.join)
+    |> add_option "source" (Option.map snd from_source)
+    |> add_option "mode" (Option.map (Printf.sprintf "0%o") mode)
+    |> add_option "uid" (Option.map string_of_int uid)
+    |> add_option "gid" (Option.map string_of_int gid)
+    |> v ~mount_type:"cache"
+
+  let tmpfs ?(options = StringMap.empty) () = v ~mount_type:"tmpfs" options
+  let secret ?(options = StringMap.empty) () = v ~mount_type:"secret" options
+end
+
 type line =
   [ `ParserDirective of parser_directive
   | `Comment of string
   | `From of from
   | `Maintainer of string
-  | `Run of shell_or_exec
+  | `Run of MountOptions.t map * shell_or_exec
   | `Cmd of shell_or_exec
   | `Expose of int list
   | `Arg of string * string option
@@ -95,18 +159,30 @@ let maybe f = function None -> empty | Some v -> f v
 
 open Printf
 
+let merge_same_target _ options1 options2 =
+  if MountOptions.equal options1 options2 then Some options1
+  else Some MountOptions.invalid
+
+let with_merged_mounts m1 m2 aux a b acc tl =
+  let merged = StringMap.union merge_same_target m1 m2 in
+  if StringMap.for_all (fun _ -> MountOptions.is_valid) merged then
+    aux (`Run (merged, `Shells (a @ b)) :: acc) tl
+  else
+    (* mount options conflict: do not crunch *)
+    aux (`Run (m1, `Shells a) :: `Run (m2, `Shells b) :: acc) tl
+
 (* Multiple RUN lines will be compressed into a single one in
    order to reduce the number of layers used *)
 let crunch l =
   let pack l =
     let rec aux acc = function
       | [] -> acc
-      | `Run (`Shell a) :: `Run (`Shell b) :: tl ->
-          aux (`Run (`Shells [ a; b ]) :: acc) tl
-      | `Run (`Shells a) :: `Run (`Shell b) :: tl ->
-          aux (`Run (`Shells (a @ [ b ])) :: acc) tl
-      | `Run (`Shells a) :: `Run (`Shells b) :: tl ->
-          aux (`Run (`Shells (a @ b)) :: acc) tl
+      | `Run (mounts1, `Shell a) :: `Run (mounts2, `Shell b) :: tl ->
+          with_merged_mounts mounts1 mounts2 aux [ a ] [ b ] acc tl
+      | `Run (mounts1, `Shells a) :: `Run (mounts2, `Shell b) :: tl ->
+          with_merged_mounts mounts1 mounts2 aux a [ b ] acc tl
+      | `Run (mounts1, `Shells a) :: `Run (mounts2, `Shells b) :: tl ->
+          with_merged_mounts mounts1 mounts2 aux a b acc tl
       | hd :: tl -> aux (hd :: acc) tl
     in
     List.rev (aux [] l)
@@ -188,6 +264,11 @@ let string_of_copy_heredoc (t : heredocs_to_dest) =
   String.concat " " (optional "--chown" chown @ List.rev header @ [ dst ])
   ^ docs
 
+let string_of_mounts map =
+  map |> StringMap.bindings
+  |> List.map MountOptions.to_string
+  |> String.concat " "
+
 let rec string_of_line ~escape (t : line) =
   match t with
   | `ParserDirective (`Escape c) -> cmd "#" ("escape=" ^ String.make 1 c)
@@ -205,7 +286,8 @@ let rec string_of_line ~escape (t : line) =
              (match alias with None -> "" | Some a -> " as " ^ a);
            ])
   | `Maintainer m -> cmd "MAINTAINER" m
-  | `Run c -> cmd "RUN" (string_of_shell_or_exec ~escape c)
+  | `Run (mounts, c) ->
+      cmd "RUN" (string_of_mounts mounts) ^ string_of_shell_or_exec ~escape c
   | `Cmd c -> cmd "CMD" (string_of_shell_or_exec ~escape c)
   | `Expose pl -> cmd "EXPOSE" (String.concat " " (List.map string_of_int pl))
   | `Arg a -> cmd "ARG" (string_of_arg ~escape a)
@@ -242,8 +324,24 @@ let heredoc ?(strip = false) ?(word = "EOF") ?(delimiter = word) fmt =
 let from ?alias ?tag ?platform image = [ `From { image; tag; alias; platform } ]
 let comment fmt = ksprintf (fun c -> [ `Comment c ]) fmt
 let maintainer fmt = ksprintf (fun m -> [ `Maintainer m ]) fmt
-let run fmt = ksprintf (fun b -> [ `Run (`Shell b) ]) fmt
-let run_exec cmds : t = [ `Run (`Exec cmds) ]
+
+let run ?(mounts = StringMap.empty) fmt =
+  ksprintf (fun b -> [ `Run (mounts, `Shell b) ]) fmt
+
+let run_exec ?(mounts = StringMap.empty) cmds : t =
+  [ `Run (mounts, `Exec cmds) ]
+
+let add_mounts mounts_to_add lst =
+  let add = function
+    | `Run (mounts, s) ->
+        let mounts =
+          StringMap.union (fun _ _ r -> Some r) mounts mounts_to_add
+        in
+        `Run (mounts, s)
+    | other -> other
+  in
+  lst |> List.map add
+
 let cmd fmt = ksprintf (fun b -> [ `Cmd (`Shell b) ]) fmt
 let cmd_exec cmds : t = [ `Cmd (`Exec cmds) ]
 let expose_port p : t = [ `Expose [ p ] ]

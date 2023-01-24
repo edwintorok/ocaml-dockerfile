@@ -115,18 +115,147 @@ val from : ?alias:string -> ?tag:string -> ?platform:string -> string -> t
 val maintainer : ('a, unit, string, t) format4 -> 'a
 (** [maintainer] sets the author field of the generated images. *)
 
-val run : ('a, unit, string, t) format4 -> 'a
+type +'a map = 'a Map.Make(String).t
+
+(** Description of a filesystem mount for {!run} and {run_exec}.
+
+    It exposes a convenient interface to define mounts that would work
+    on sufficiently new versions of both Docker BuildKit and Podman 4.x.
+    Flags that are specific to only Docker or only Podman are not exposed by
+    default but can be specified via [?options].
+
+    @see <https://docs.docker.com/engine/reference/builder/#mount-types> Docker reference for [RUN --mount]
+    @see <https://github.com/containers/common/blob/main/docs/Containerfile.5.md#format> Podman reference for [RUN --mount]
+*)
+module MountOptions : sig
+  type t
+  (** description of a RUN --mount *)
+
+  val v : mount_type:string -> string map -> t
+  (** [v ~mount_type options] is a [mount_type] mount with specified [options].
+
+    Do not include [target] here: the target is the key of the [MountOptions map].
+
+    @see <https://docs.docker.com/engine/reference/builder/#mount-types> Docker reference for [RUN --mount]
+    @see <https://github.com/containers/common/blob/main/docs/Containerfile.5.md#format> Podman reference for [RUN --mount]
+*)
+
+  type sharing =
+    | Shared
+        (** no locking used, concurrent builds write to same cache directory  on the host *)
+    | Locked  (** pauses other writers until the first one releases the mount *)
+
+  type from_source = string option * string
+  (** Pair of [from] and [source].
+
+    [from=None] refers to the build context
+    [from=Some stage] refers to another build stage in the current dockerfile.
+    [source] is a path inside [from]
+*)
+
+  val bind :
+    ?options:string map -> ?rw:bool -> from_source:from_source -> unit -> t
+  (** [bind ?options ?rw ~from_source ()] is a bind mount that makes a path from
+ the host or another build stage accessible from the current build stage.
+
+ @param target the target of the mount inside the container. Usually a
+ path, but for 'podman' it can also contain SELinux flags like ',z' or ',Z'
+
+ @param from_source is either
+ [None, host_source] which bind mounts [host_source] from the build context (a relative path),
+ or [Some stage, stage_source] which binds mounts [stage_source] from another build [stage] in the current container.
+
+ @param rw enables write discard on the mount. By default the mount would be read-only. It is not possible to persist writes.
+
+ @param options extra bind mount options, specific to docker or podman
+
+ @see <https://docs.docker.com/engine/reference/builder/#run---mounttypebind> Docker --mount=type=bind reference
+ *)
+
+  val cache :
+    ?options:string map ->
+    ?id:string ->
+    ?ro:bool ->
+    ?sharing:sharing ->
+    ?from_source:from_source ->
+    ?mode:int ->
+    ?uid:int ->
+    ?gid:int ->
+    unit ->
+    t
+  (** [cache ?options ?id ?ro ?sharing ?from_source ?mode ?uid ?gid ())] is a cache mount available during container build stage.
+
+    @param id the cache id: all container builds with same cache id (even from other unrelated container builds) will get same writable directory mounted. Defaults to [target].
+        This will typically be a directory on the host managed by the container builder.
+
+    @param target where the cache is mounted inside the container
+        The RUN command needs to cope with a completely empty cache, and with files from the cache being deleted by docker's GC in arbitrary order.
+        i.e. a download cache where each file is self-contained, or a content-addressed cache storage is appropriate.
+        Something like a git repository or the entire .opam, because it'd easily get corrupted if parts of it get randomly deleted.
+
+    @param ro whether the cache is read-only (by default it is writable)
+
+    @param sharing how to share the cache between concurrent builds. The default is {!Shared} which doesn't use any locking.
+        See {!sharing}.
+
+    @param from_source the initial contents of the cache. Default is empty.
+
+    @param mode File mode for cache directory.
+
+    @param uid UID of cache directory, default 0.
+    @param gid GID of cache directory, default 0.
+
+    @param options extra options specific to Docker or Podman
+
+    @see <https://docs.docker.com/engine/reference/builder/#run---mounttypecache> Docker --mount=type=cache reference
+*)
+
+  val tmpfs : ?options:string map -> unit -> t
+  (** [tmpfs ?options ()] is a tmpfs mount at [target].
+
+    @param options are additional options, specific to Docker or Podman
+
+    @see <https://docs.docker.com/engine/reference/builder/#run---mounttypetmpfs> Docker --mount=type=tmpfs reference
+*)
+
+  val secret : ?options:string map -> unit -> t
+  (** [secret ?options ()] is a secret mount at [target].
+
+    @param options are additional options, specific to Docker or Podman
+
+    @see <https://docs.docker.com/engine/reference/builder/#run---mounttypesecret> Docker --mount=type=secret reference
+*)
+end
+
+val run : ?mounts:MountOptions.t map -> ('a, unit, string, t) format4 -> 'a
 (** [run fmt] will execute any commands in a new layer on top of the current
   image and commit the results. The resulting committed image will be used
   for the next step in the Dockerfile.  The string result of formatting
-  [arg] will be passed as a [/bin/sh -c] invocation. *)
+  [arg] will be passed as a [/bin/sh -c] invocation.
 
-val run_exec : string list -> t
+  @param mounts is a map of mount targets to {!MountOptions}.
+    During a container build the container build engine will create the
+    specified mounts for the duration of the RUN command.
+    They will not persist in the final image.
+*)
+
+val run_exec : ?mounts:MountOptions.t map -> string list -> t
 (** [run_exec args] will execute any commands in a new layer on top of the current
   image and commit the results. The resulting committed image will be used
   for the next step in the Dockerfile.  The [args] form makes it possible
   to avoid shell string munging, and to run commands using a base image that
-  does not contain [/bin/sh]. *)
+  does not contain [/bin/sh].
+
+  @param mounts is a map of mount targets to {!MountOptions}.
+    During a container build the container build engine will create the
+    specified mounts for the duration of the RUN command.
+    They will not persist in the final image.
+*)
+
+val add_mounts : MountOptions.t map -> t -> t
+(** [add_mounts map t] will add [map] to the mounts of [t].
+    Any existing mounts to the same target are overwritten.
+    Has no effect if [t] is not a [RUN] command *)
 
 val cmd : ('a, unit, string, t) format4 -> 'a
 (** [cmd args] provides defaults for an executing container. These defaults
