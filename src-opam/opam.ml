@@ -100,7 +100,7 @@ let bubblewrap_and_dev_packages distro =
     match D.package_manager distro with
     | `Apk -> Linux.Apk.dev_packages
     | `Apt -> Linux.Apt.dev_packages
-    | `Yum -> Linux.RPM.dev_packages
+    | `Yum -> Linux.RPM.dev_packages ?clean:None
     | `Zypper -> Linux.Zypper.dev_packages
     | `Pacman -> Linux.Pacman.dev_packages
     | `Cygwin | `Windows -> assert false

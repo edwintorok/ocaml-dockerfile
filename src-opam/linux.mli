@@ -33,19 +33,21 @@ module RPM : sig
   val update : t
   (** [update] will run [yum update -y] *)
 
-  val install : ('a, unit, string, t) format4 -> 'a
-  (** [install fmt] will run [yum install] on the supplied package list. *)
+  val install : ?clean:bool -> ('a, unit, string, t) format4 -> 'a
+  (** [install ?clean fmt] will run [yum install] on the supplied package list.
+  *)
 
-  val groupinstall : int -> ('a, unit, string, t) format4 -> 'a
-  (** [groupinstall ver fmt] will run [yum groupinstall] or [yum group install]
-      on the supplied package list. ver selects the appropriate syntax *)
+  val groupinstall : ?clean:bool -> int -> ('a, unit, string, t) format4 -> 'a
+  (** [groupinstall ?clean ver fmt] will run [yum groupinstall] or
+      [yum group install] on the supplied package list. ver selects the
+      appropriate syntax *)
 
   val add_user : ?uid:int -> ?gid:int -> ?sudo:bool -> string -> t
   (** [add_user username] will install a new user with name [username] and a
       locked password. If [sudo] is true then root access with no password will
       also be configured. The default value for [sudo] is [false]. *)
 
-  val dev_packages : ?extra:string -> unit -> t
+  val dev_packages : ?clean:bool -> ?extra:string -> unit -> t
   (** [dev_packages ?extra ()] will install the base development tools and
       [sudo], [passwd] and [git]. Extra packages may also be optionally supplied
       via [extra]. *)

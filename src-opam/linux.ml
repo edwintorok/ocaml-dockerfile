@@ -29,28 +29,33 @@ end
 
 let sudo_nopasswd = "ALL=(ALL:ALL) NOPASSWD:ALL"
 
+let run_clean ?(clean = true) ~(clean_cmd : (t, unit, string, t) format4)
+    (fmt : ('a, unit, string, t) format4) =
+  if clean then run (fmt ^^ " && " ^^ clean_cmd) else run fmt
+
 (** RPM rules *)
 module RPM = struct
   let update = run "yum update -y"
+  let clean_cmd = format_of_string "yum clean packages"
 
-  let install fmt =
-    ksprintf (fun s -> run "yum install -y %s && yum clean packages" s) fmt
+  let install ?clean fmt =
+    ksprintf (fun s -> run_clean ?clean ~clean_cmd "yum install -y %s" s) fmt
 
-  let groupinstall ver fmt =
+  let groupinstall ?clean ver fmt =
     match ver with
     | 3 ->
         (* dnf3 syntax which was deprecated but worked in dnf4 *)
         ksprintf
-          (fun s -> run "yum groupinstall -y %s && yum clean packages" s)
+          (fun s -> run_clean ?clean ~clean_cmd "yum groupinstall -y %s" s)
           fmt
     | _ ->
         (* dnf4 and dnf5 syntax *)
         ksprintf
-          (fun s -> run "yum group install -y %s && yum clean packages" s)
+          (fun s -> run_clean ?clean ~clean_cmd "yum group install -y %s" s)
           fmt
 
-  let dev_packages ?extra () =
-    install
+  let dev_packages ?clean ?extra () =
+    install ?clean
       "sudo passwd bzip2 unzip patch rsync nano gcc-c++ git tar curl xz \
        libX11-devel which m4 gawk diffutils findutils%s"
       (match extra with None -> "" | Some x -> " " ^ x)
