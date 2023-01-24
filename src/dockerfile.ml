@@ -93,7 +93,7 @@ module MountOptions = struct
     |> StringMap.bindings
     |> List.map (fun (k, v) -> k ^ "=" ^ v)
     |> String.concat ","
-    |> Printf.sprintf "--mount=type=%s,%s" t.mount_type
+    |> Printf.sprintf "--mount=type=%s,%s " t.mount_type
 
   type from_source = string option * string
   type sharing = Shared | Locked
@@ -331,16 +331,21 @@ let run ?(mounts = StringMap.empty) fmt =
 let run_exec ?(mounts = StringMap.empty) cmds : t =
   [ `Run (mounts, `Exec cmds) ]
 
-let add_mounts mounts_to_add lst =
-  let add = function
-    | `Run (mounts, s) ->
-        let mounts =
-          StringMap.union (fun _ _ r -> Some r) mounts mounts_to_add
-        in
-        `Run (mounts, s)
-    | other -> other
+let add_mounts_line mounts_to_add = function
+  | `Run (mounts, s) ->
+      let mounts = StringMap.union (fun _ _ r -> Some r) mounts mounts_to_add in
+      `Run (mounts, s)
+  | other -> other
+
+let add_mounts mounts_to_add (lst : t) =
+  lst |> List.map (add_mounts_line mounts_to_add)
+
+let add_cache_mounts spec lst =
+  let fold_user_lines (user, acc) : line -> string * t = function
+    | `User user as line -> (user, line :: acc)
+    | line -> (user, add_mounts_line (spec ~user) line :: acc)
   in
-  lst |> List.map add
+  lst |> List.fold_left fold_user_lines ("root", empty) |> snd |> List.rev
 
 let cmd fmt = ksprintf (fun b -> [ `Cmd (`Shell b) ]) fmt
 let cmd_exec cmds : t = [ `Cmd (`Exec cmds) ]

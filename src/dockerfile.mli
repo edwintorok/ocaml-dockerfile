@@ -257,6 +257,12 @@ val add_mounts : MountOptions.t map -> t -> t
     Any existing mounts to the same target are overwritten.
     Has no effect if [t] is not a [RUN] command *)
 
+val add_cache_mounts : (user:string -> MountOptions.t map) -> t -> t
+(** [add_cache_mounts spec dockerfile] will add user specific cache mounts.
+
+    @param spec determines what cache to mount for [user]
+*)
+
 val cmd : ('a, unit, string, t) format4 -> 'a
 (** [cmd args] provides defaults for an executing container. These defaults
   can include an executable, or they can omit the executable, in which case

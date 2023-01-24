@@ -46,16 +46,43 @@ type opam_hashes = {
   opam_master_hash : string;
 }
 
+val auto_cache : Ocaml_version.arch -> Distro.t -> Dockerfile.t -> Dockerfile.t
+(** [auto_cache arch distro dockerfile] adds automatic caching to [dockerfile].
+
+    It will create the following mounts depending on whether the command runs as root
+    or as a regular user:
+
+    /var/cache for [root]. According to the FHS applications must be able to cope with arbitrary files being deleted,
+        which is the same requirement that docker cache mounts have.
+        However a root application can create a lockfile elsewhere and have a reasonable expectation that it is the only
+        one using it (e.g. package managers).
+        So use a distro-specific cache id, and mount type locked.
+
+    /home/opam/.cache for [opam] user.
+    This is not locked (even on a regular machine there could be multiple applications running with same homedir,
+    so applications must manage locking themselves if needed).
+    It uses a very coarse cache ID that includes just the OS type
+    (the homedir may have been on an NFS share, so applications must be able to cope with a shared homedir between
+    different distros already).
+
+    When using this ensure that any commands you run do not clean caches (e.g. 'yum clean all'), otherwise
+    they will also clean the cache of other builds.
+
+    @see <https://refspecs.linuxfoundation.org/FHS_3.0/fhs/ch05s05.html> File Hierarchy Standard /var/cache
+    @see <https://specifications.freedesktop.org/basedir-spec/basedir-spec-latest.html> XDG_CACHE_HOME on $HOME/.cache
+*)
+
 val gen_opam2_distro :
   ?win10_revision:Distro.win10_lcu ->
   ?winget:string ->
   ?clone_opam_repo:bool ->
   ?arch:Ocaml_version.arch ->
   ?labels:(string * string) list ->
+  ?enable_auto_cache:bool ->
   opam_hashes:opam_hashes ->
   Distro.t ->
   string * Dockerfile.t
-(** [gen_opam2_distro ~opam_hashes d] will generate a Dockerfile
+(** [gen_opam2_distro ?enable_auto_cache ~opam_hashes d] will generate a Dockerfile
    for Linux distribution [d] with opam 2.0, opam 2.1, opam 2.2 and opam master,
    per hash given in parameter.
    @return a tuple of the Docker tag and the Dockerfile.
@@ -64,9 +91,13 @@ val gen_opam2_distro :
    If [arch] is not specified, it defaults to the base image that is assumed
    to be multiarch (the main exception to this is i386, which requires different
    base images from amd64).
+   If [enable_auto_cache] is true (the default) then Docker BuildKit / Podman 4.x cache mounts
+   will be used to cache system package installation, and opam package downloads.
    For native Windows distributions, if [winget] is omitted, then winget
    will be build in an prepended build stage. If specified, then
-   winget will be pulled from the [winget] external image. *)
+   winget will be pulled from the [winget] external image.
+
+*)
 
 val all_ocaml_compilers :
   string -> Ocaml_version.arch -> Distro.t -> string * Dockerfile.t

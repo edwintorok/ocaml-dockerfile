@@ -386,8 +386,34 @@ let windows_opam2 ?win10_revision ?winget ?(labels = []) ?arch distro () =
   @@ winget_setup @@ ocaml_for_windows @@ Windows.Cygwin.setup ()
   @@ Windows.Cygwin.Git.init ()
 
+module StringMap = Map.Make (String)
+
+let auto_cache arch distro =
+  let user_to_cache_id = function
+    | "root" | "0" ->
+        ( None,
+          "/var/cache",
+          MountOptions.Locked,
+          Printf.sprintf "%s;%s"
+            (distro |> Distro.human_readable_string_of_distro)
+            (arch |> Ocaml_version.string_of_arch) )
+    | regular ->
+        ( Some (1000, 1000),
+          (* TODO: check opam *)
+          Printf.sprintf "/home/%s/.cache" regular,
+          MountOptions.Shared,
+          distro |> Distro.os_family_of_distro |> Distro.os_family_to_string )
+  in
+  let add_user_cache_mount ~user =
+    let uidgid, target, sharing, id = user_to_cache_id user in
+    let uid = Option.map fst uidgid and gid = Option.map snd uidgid in
+    MountOptions.cache ~id ~sharing ?uid ?gid () |> StringMap.singleton target
+  in
+  Dockerfile.add_cache_mounts add_user_cache_mount
+
 let gen_opam2_distro ?win10_revision ?winget ?(clone_opam_repo = true) ?arch
-    ?labels ~opam_hashes d =
+    ?labels ?(enable_auto_cache = true) ~opam_hashes d =
+  let clean = not enable_auto_cache in
   let fn =
     match D.package_manager d with
     | `Apk -> apk_opam2 ?labels ?arch ~opam_hashes d ()
@@ -400,8 +426,8 @@ let gen_opam2_distro ?win10_revision ?winget ?(clone_opam_repo = true) ?arch
           | `CentOS _ -> true
           | _ -> false
         in
-        yum_opam2 ?labels ?arch ~yum_workaround ~enable_powertools ~opam_hashes
-          d ()
+        yum_opam2 ?labels ?arch ~clean ~yum_workaround ~enable_powertools
+          ~opam_hashes d ()
     | `Zypper -> zypper_opam2 ?labels ?arch ~opam_hashes d ()
     | `Pacman -> pacman_opam2 ?labels ?arch ~opam_hashes d ()
     | `Windows -> windows_opam2 ?win10_revision ?winget ?labels ?arch d ()
@@ -420,7 +446,8 @@ let gen_opam2_distro ?win10_revision ?winget ?(clone_opam_repo = true) ?arch
     | None -> empty
     | Some pers -> entrypoint_exec [ pers ]
   in
-  (D.tag_of_distro d, fn @@ clone @@ pers)
+  ( D.tag_of_distro d,
+    fn @@ clone @@ pers |> auto_cache (Option.value ~default:`X86_64 arch) d )
 
 let create_switch ~arch distro t =
   let create_switch switch pkg =
