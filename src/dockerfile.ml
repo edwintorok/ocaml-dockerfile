@@ -62,36 +62,43 @@ type healthcheck_options = {
 type healthcheck = [ `Cmd of healthcheck_options * shell_or_exec | `None ]
 [@@deriving sexp]
 
-module StringMap = Map.Make (String)
+let escape_string ~char_to_escape ~escape v =
+  let len = String.length v in
+  let buf = Buffer.create len in
+  let j = ref 0 in
+  for i = 0 to len - 1 do
+    if v.[i] = char_to_escape || v.[i] = escape then (
+      if i - !j > 0 then Buffer.add_substring buf v !j (i - !j);
+      Buffer.add_char buf escape;
+      j := i)
+  done;
+  Buffer.add_substring buf v !j (len - !j);
+  Buffer.contents buf
 
-type +'a map = 'a StringMap.t
+module Mount = struct
+  type t =
+      { mount_type : string
+      ; target:string
+      ; options : (string * string) list } [@@deriving sexp]
 
-let sexp_of_map sexp_of_e t =
-  t |> StringMap.bindings
-  |> sexp_of_list @@ sexp_of_pair sexp_of_string sexp_of_e
+  let v ~mount_type ~target options = { mount_type; target; options }
 
-let map_of_sexp e_of_sexp sexp =
-  sexp
-  |> list_of_sexp @@ pair_of_sexp string_of_sexp e_of_sexp
-  |> List.to_seq |> StringMap.of_seq
+  let equal (a:t) (b:t) = (a = b)
 
-module MountOptions = struct
-  type t = { mount_type : string; options : string map } [@@deriving sexp]
+  let merge_consecutive acc next =
+      match acc with
+      | prev :: _ when equal prev next -> acc
+      | _ -> next :: acc
 
-  let v ~mount_type options = { mount_type; options }
-  let invalid = { mount_type = ""; options = StringMap.empty }
+  (** [merge a b] merges consecutive duplicates *)
+  let merge (a:t list) (b:t list) =
+      List.fold_left merge_consecutive [] (a @ b)
+      |> List.rev
 
-  let equal a b =
-    a.mount_type = b.mount_type
-    && StringMap.equal String.equal a.options b.options
-
-  let is_valid t = not @@ equal t invalid
-
-  let to_string (target, t) =
-    t.options
-    |> StringMap.add "target" target
-    |> StringMap.bindings
-    |> List.map (fun (k, v) -> k ^ "=" ^ v)
+  let to_string ~escape t =
+  	let do_escape = escape_string ~char_to_escape:' ' ~escape in
+    ("target", t.target) :: t.options
+    |> List.map (fun (k, v) -> (do_escape k) ^ "=" ^ (do_escape v))
     |> String.concat ","
     |> Printf.sprintf "--mount=type=%s,%s " t.mount_type
 
@@ -101,17 +108,17 @@ module MountOptions = struct
   let string_of_sharing = function Shared -> "shared" | Locked -> "locked"
 
   let add_option name optval options =
-    match optval with None -> options | Some v -> StringMap.add name v options
+    match optval with None -> options | Some v -> (name, v) :: options
 
-  let bind ?(options = StringMap.empty) ?rw ~from_source:(from, source) () =
+  let bind ?(options = []) ?rw ~from_source:(from, source) target =
     options
     |> add_option "source" (Some source)
     |> add_option "from" from
     |> add_option "rw" (Option.map string_of_bool rw)
-    |> v ~mount_type:"bind"
+    |> v ~mount_type:"bind" ~target
 
-  let cache ?(options = StringMap.empty) ?id ?ro ?sharing ?from_source ?mode
-      ?uid ?gid () =
+  let cache ?(options = []) ?id ?ro ?sharing ?from_source ?mode
+      ?uid ?gid target =
     options |> add_option "id" id
     |> add_option "ro" (Option.map string_of_bool ro)
     |> add_option "sharing" (Option.map string_of_sharing sharing)
@@ -120,10 +127,10 @@ module MountOptions = struct
     |> add_option "mode" (Option.map (Printf.sprintf "0%o") mode)
     |> add_option "uid" (Option.map string_of_int uid)
     |> add_option "gid" (Option.map string_of_int gid)
-    |> v ~mount_type:"cache"
+    |> v ~mount_type:"cache" ~target
 
-  let tmpfs ?(options = StringMap.empty) () = v ~mount_type:"tmpfs" options
-  let secret ?(options = StringMap.empty) () = v ~mount_type:"secret" options
+  let tmpfs ?(options = []) target = v ~mount_type:"tmpfs" ~target options
+  let secret ?(options = []) target = v ~mount_type:"secret" ~target options
 end
 
 type line =
@@ -131,7 +138,7 @@ type line =
   | `Comment of string
   | `From of from
   | `Maintainer of string
-  | `Run of MountOptions.t map * shell_or_exec
+  | `Run of Mount.t list * shell_or_exec
   | `Cmd of shell_or_exec
   | `Expose of int list
   | `Arg of string * string option
@@ -159,30 +166,18 @@ let maybe f = function None -> empty | Some v -> f v
 
 open Printf
 
-let merge_same_target _ options1 options2 =
-  if MountOptions.equal options1 options2 then Some options1
-  else Some MountOptions.invalid
-
-let with_merged_mounts m1 m2 aux a b acc tl =
-  let merged = StringMap.union merge_same_target m1 m2 in
-  if StringMap.for_all (fun _ -> MountOptions.is_valid) merged then
-    aux (`Run (merged, `Shells (a @ b)) :: acc) tl
-  else
-    (* mount options conflict: do not crunch *)
-    aux (`Run (m1, `Shells a) :: `Run (m2, `Shells b) :: acc) tl
-
 (* Multiple RUN lines will be compressed into a single one in
    order to reduce the number of layers used *)
 let crunch l =
   let pack l =
     let rec aux acc = function
       | [] -> acc
-      | `Run (mounts1, `Shell a) :: `Run (mounts2, `Shell b) :: tl ->
-          with_merged_mounts mounts1 mounts2 aux [ a ] [ b ] acc tl
-      | `Run (mounts1, `Shells a) :: `Run (mounts2, `Shell b) :: tl ->
-          with_merged_mounts mounts1 mounts2 aux a [ b ] acc tl
-      | `Run (mounts1, `Shells a) :: `Run (mounts2, `Shells b) :: tl ->
-          with_merged_mounts mounts1 mounts2 aux a b acc tl
+      | `Run (mounts1, `Shell a) :: `Run (mounts2, `Shell b) :: tl when mounts1 = mounts2->
+          aux (`Run (mounts1, `Shells [a; b]) :: acc) tl
+      | `Run (mounts1, `Shells a) :: `Run (mounts2, `Shell b) :: tl when mounts1 = mounts2 ->
+          aux (`Run (mounts1, `Shells (a @ [b])) :: acc) tl
+      | `Run (mounts1, `Shells a) :: `Run (mounts2, `Shells b) :: tl when mounts1 = mounts2->
+          aux (`Run (mounts1, `Shells (a @ b)) :: acc) tl
       | hd :: tl -> aux (hd :: acc) tl
     in
     List.rev (aux [] l)
@@ -207,18 +202,7 @@ let string_of_shell_or_exec ~escape (t : shell_or_exec) =
   | `Shells l -> String.concat (" && " ^ String.make 1 escape ^ "\n  ") l
   | `Exec sl -> json_array_of_list sl
 
-let quote_env_var ~escape v =
-  let len = String.length v in
-  let buf = Buffer.create len in
-  let j = ref 0 in
-  for i = 0 to len - 1 do
-    if v.[i] = '"' || v.[i] = escape then (
-      if i - !j > 0 then Buffer.add_substring buf v !j (i - !j);
-      Buffer.add_char buf escape;
-      j := i)
-  done;
-  Buffer.add_substring buf v !j (len - !j);
-  Buffer.contents buf
+let quote_env_var = escape_string ~char_to_escape:'"'
 
 let string_of_env_var ~escape (name, value) =
   sprintf {|%s="%s"|} name (quote_env_var ~escape value)
@@ -264,9 +248,9 @@ let string_of_copy_heredoc (t : heredocs_to_dest) =
   String.concat " " (optional "--chown" chown @ List.rev header @ [ dst ])
   ^ docs
 
-let string_of_mounts map =
-  map |> StringMap.bindings
-  |> List.map MountOptions.to_string
+let string_of_mounts ~escape map =
+  map
+  |> List.map Mount.(to_string ~escape)
   |> String.concat " "
 
 let rec string_of_line ~escape (t : line) =
@@ -287,7 +271,7 @@ let rec string_of_line ~escape (t : line) =
            ])
   | `Maintainer m -> cmd "MAINTAINER" m
   | `Run (mounts, c) ->
-      cmd "RUN" (string_of_mounts mounts) ^ string_of_shell_or_exec ~escape c
+      cmd "RUN" (string_of_mounts ~escape mounts) ^ string_of_shell_or_exec ~escape c
   | `Cmd c -> cmd "CMD" (string_of_shell_or_exec ~escape c)
   | `Expose pl -> cmd "EXPOSE" (String.concat " " (List.map string_of_int pl))
   | `Arg a -> cmd "ARG" (string_of_arg ~escape a)
@@ -318,6 +302,9 @@ and string_of_healthcheck ~escape options c =
 (* Function interface *)
 let parser_directive pd : t = [ `ParserDirective pd ]
 
+(* 1 should be enough for cache mounts, but here documents want 1.4 *)
+let buildkit_syntax = parser_directive (`Syntax "docker/dockerfile:1")
+
 let heredoc ?(strip = false) ?(word = "EOF") ?(delimiter = word) fmt =
   ksprintf (fun here_document -> { here_document; strip; word; delimiter }) fmt
 
@@ -325,27 +312,20 @@ let from ?alias ?tag ?platform image = [ `From { image; tag; alias; platform } ]
 let comment fmt = ksprintf (fun c -> [ `Comment c ]) fmt
 let maintainer fmt = ksprintf (fun m -> [ `Maintainer m ]) fmt
 
-let run ?(mounts = StringMap.empty) fmt =
+let run ?(mounts = []) fmt =
   ksprintf (fun b -> [ `Run (mounts, `Shell b) ]) fmt
 
-let run_exec ?(mounts = StringMap.empty) cmds : t =
+let run_exec ?(mounts = []) cmds : t =
   [ `Run (mounts, `Exec cmds) ]
 
-let add_mounts_line mounts_to_add = function
+let prefix_mounts_line prefix = function
   | `Run (mounts, s) ->
-      let mounts = StringMap.union (fun _ _ r -> Some r) mounts mounts_to_add in
-      `Run (mounts, s)
+      `Run (Mount.merge prefix mounts, s)
   | other -> other
 
-let add_mounts mounts_to_add (lst : t) =
-  lst |> List.map (add_mounts_line mounts_to_add)
-
-let add_cache_mounts spec lst =
-  let fold_user_lines (user, acc) : line -> string * t = function
-    | `User user as line -> (user, line :: acc)
-    | line -> (user, add_mounts_line (spec ~user) line :: acc)
-  in
-  lst |> List.fold_left fold_user_lines ("root", empty) |> snd |> List.rev
+let with_mounts prefix dockerfiles =
+  dockerfiles |> List.concat |> crunch
+  |> List.map (prefix_mounts_line prefix)
 
 let cmd fmt = ksprintf (fun b -> [ `Cmd (`Shell b) ]) fmt
 let cmd_exec cmds : t = [ `Cmd (`Exec cmds) ]

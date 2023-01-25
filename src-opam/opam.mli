@@ -46,31 +46,18 @@ type opam_hashes = {
   opam_master_hash : string;
 }
 
-val auto_cache : Ocaml_version.arch -> Distro.t -> Dockerfile.t -> Dockerfile.t
-(** [auto_cache arch distro dockerfile] adds automatic caching to [dockerfile].
+(** [with_pkg_cache ?arch ~cache distro t] adds a package manager specific cache mount to [t].
+     The cache is shared across all container builds with same [distro] and [arch] *)
+val with_pkg_cache : ?arch:Ocaml_version.arch -> cache:bool -> Distro.t -> Dockerfile.t list -> Dockerfile.t
 
-    It will create the following mounts depending on whether the command runs as root
-    or as a regular user:
+(** [with_user_cache t] adds a /home/opam/.cache mount to [t], which is expected to contain commands running as the 'opam' user *)
+val with_user_cache: Dockerfile.t list -> Dockerfile.t
 
-    /var/cache for [root]. According to the FHS applications must be able to cope with arbitrary files being deleted,
-        which is the same requirement that docker cache mounts have.
-        However a root application can create a lockfile elsewhere and have a reasonable expectation that it is the only
-        one using it (e.g. package managers).
-        So use a distro-specific cache id, and mount type locked.
-
-    /home/opam/.cache for [opam] user.
-    This is not locked (even on a regular machine there could be multiple applications running with same homedir,
-    so applications must manage locking themselves if needed).
-    It uses a very coarse cache ID that includes just the OS type
-    (the homedir may have been on an NFS share, so applications must be able to cope with a shared homedir between
-    different distros already).
-
-    When using this ensure that any commands you run do not clean caches (e.g. 'yum clean all'), otherwise
-    they will also clean the cache of other builds.
-
-    @see <https://refspecs.linuxfoundation.org/FHS_3.0/fhs/ch05s05.html> File Hierarchy Standard /var/cache
-    @see <https://specifications.freedesktop.org/basedir-spec/basedir-spec-latest.html> XDG_CACHE_HOME on $HOME/.cache
+(** [distro_install ?arch ?cache ?switch_user distro packages] will install [packages] using the [distro]'s package manager.
+	Caching is on by default, but can be controlled with [?cache].
+	@see {!with_pkg_cache}
 *)
+val distro_install: ?arch:Ocaml_version.arch -> ?cache:bool -> ?switch_user:bool -> Distro.t -> string list -> Dockerfile.t
 
 val gen_opam2_distro :
   ?win10_revision:Distro.win10_lcu ->
@@ -78,7 +65,7 @@ val gen_opam2_distro :
   ?clone_opam_repo:bool ->
   ?arch:Ocaml_version.arch ->
   ?labels:(string * string) list ->
-  ?enable_auto_cache:bool ->
+  ?cache:bool ->
   opam_hashes:opam_hashes ->
   Distro.t ->
   string * Dockerfile.t
