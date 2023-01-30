@@ -1,0 +1,15 @@
+(executable
+  (name genall)
+  (libraries dockerfile-opam dockerfile-cmd)
+)
+
+(rule
+    (target Containerfile)
+    (action (with-stdout-to %{target} (run ./genall.exe)))
+)
+
+(rule
+  (alias docker-build)
+  (deps (:dockerfile Containerfile))
+  (action (setenv DOCKER_BUILDKIT 1 (run docker build -f %{dockerfile} .)))
+)
