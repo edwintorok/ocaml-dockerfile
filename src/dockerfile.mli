@@ -313,6 +313,13 @@ val mount_ssh :
     @see <https://docs.docker.com/engine/reference/builder/#run---mounttypessh>
       Docker --mount=type=ssh reference *)
 
+val with_mounts : mount list -> t list -> t
+(** [with_mounts mounts dockerfiles] will crunch [dockerfiles], and prefix each
+    RUN command with [mounts], and keep other lines unchanged. Duplicate mounts
+    at the tail of [mounts] and head of existing RUN commands will be merged,
+    however other duplicates will be retained. (e.g. with nested bind and cache
+    mounts order matters) *)
+
 val cmd : ('a, unit, string, t) format4 -> 'a
 (** [cmd args] provides defaults for an executing container. These defaults can
     include an executable, or they can omit the executable, in which case you
