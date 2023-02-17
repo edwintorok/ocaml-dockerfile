@@ -49,26 +49,45 @@ type opam_hashes = {
   opam_master_hash : string;
 }
 
+val with_pkg_cache :
+  ?arch:Ocaml_version.arch ->
+  cache:bool ->
+  Distro.t ->
+  Dockerfile.t list ->
+  Dockerfile.t
+(** [with_pkg_cache ?arch ~cache distro t] adds a package manager specific cache
+    mount to [t]. The cache is shared across all container builds with same
+    [distro] and [arch] *)
+
+val with_user_cache : Dockerfile.t list -> Dockerfile.t
+(** [with_user_cache t] adds a /home/opam/.cache mount to [t], which is expected
+    to contain commands running as the 'opam' user *)
+
 val gen_opam2_distro :
   ?override_tag:string ->
   ?clone_opam_repo:bool ->
   ?arch:Ocaml_version.arch ->
   ?labels:(string * string) list ->
+  ?cache:bool ->
   opam_hashes:opam_hashes ->
   Distro.t ->
   string * Dockerfile.t
-(** [gen_opam2_distro ~opam_hashes d] will generate a Dockerfile for Linux
-    distribution [d] with opam 2.0, opam 2.1, opam 2.2 and opam master, per hash
-    given in parameter.
+(** [gen_opam2_distro ?enable_auto_cache ~opam_hashes d] will generate a
+    Dockerfile for Linux distribution [d] with opam 2.0, opam 2.1, opam 2.2 and
+    opam master, per hash given in parameter.
     @return
       a tuple of the Docker tag and the Dockerfile. If [clone_opam_repo] is true
       (the default) then the Dockerfile will also git clone the official
       opam-repository into [/home/opam/opam-repository]. If [arch] is not
       specified, it defaults to the base image that is assumed to be multiarch
       (the main exception to this is i386, which requires different base images
-      from amd64). For native Windows distributions, if [winget] is omitted,
-      then winget will be build in an prepended build stage. If specified, then
-      winget will be pulled from the [winget] external image. *)
+      from amd64). If [enable_auto_cache] is true (the default) then Docker
+      BuildKit / Podman 4.x cache mounts will be used to cache system package
+      installation, and opam package downloads. For native Windows
+      distributions, if [winget] is omitted, then winget will be build in an
+      prepended build stage. If specified, then winget will be pulled from the
+      [winget] external image. Caching is on by default, but can be controlled
+      with [?cache]. *)
 
 val ocaml_depexts : Distro.t -> Ocaml_version.t -> Dockerfile.t
 (** [ocaml_depexts distro version] returns packages that are required under

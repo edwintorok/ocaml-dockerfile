@@ -25,6 +25,16 @@ let personality ?arch distro =
   | Some arch -> D.personality (D.os_family_of_distro distro) arch
 
 let run_as_opam fmt = Linux.run_as_user "opam" fmt
+let user_cache = mount_cache ~uid:1000 ~gid:1000 ~target:"/home/opam/.cache" ()
+
+let root_cache ?(dir = "/var/cache") ?(locked = true) arch distro tool =
+  let id =
+    Printf.sprintf "%s/%s#%s;%s" dir tool
+      (distro |> Distro.tag_of_distro)
+      (arch |> Ocaml_version.string_of_arch)
+  in
+  let target = tool |> Filename.concat dir in
+  mount_cache ~target ~id ~sharing:(if locked then `Locked else `Shared) ()
 
 let maybe_link_opam add_default_link prefix branch =
   if add_default_link then
@@ -95,22 +105,46 @@ let maybe_build_bubblewrap_from_source ?(prefix = "/usr/local") distro =
            rel prefix
       @@ run "rm -rf %s bubblewrap-%s" file rel
 
-let bubblewrap_and_dev_packages distro =
+let with_pkg_cache ?(arch = `X86_64) ~cache distro t =
+  let mounts =
+    if cache then
+      match D.package_manager distro with
+      | `Apk -> [ root_cache arch distro "apk" ]
+      | `Apt ->
+          [
+            root_cache arch distro "apt";
+            root_cache ~dir:"lib" arch distro "apt";
+          ]
+      | `Yum -> [ root_cache arch distro "yum"; root_cache arch distro "dnf" ]
+      | `Zypper -> [ root_cache arch distro "zypper" ]
+      | `Pacman -> [ root_cache arch distro "pacman" ]
+      | `Cygwin | `Windows -> assert false
+    else []
+  in
+  Dockerfile.with_mounts mounts t
+
+let with_user_cache t = Dockerfile.with_mounts [ user_cache ] t
+
+let bubblewrap_and_dev_packages ?arch ~cache distro =
+  let clean = not cache in
   let dev_packages =
     match D.package_manager distro with
     | `Apk -> Linux.Apk.dev_packages
     | `Apt -> Linux.Apt.dev_packages
-    | `Yum -> Linux.RPM.dev_packages ?clean:None
+    | `Yum -> Linux.RPM.dev_packages ~clean
     | `Zypper -> Linux.Zypper.dev_packages
     | `Pacman -> Linux.Pacman.dev_packages
     | `Cygwin | `Windows -> assert false
   in
-  match D.bubblewrap_version distro with
-  | Some version when version >= bubblewrap_minimum ->
-      dev_packages ~extra:"bubblewrap" ()
-  | _ ->
-      copy ~from:"0" ~src:[ "/usr/local/bin/bwrap" ] ~dst:"/usr/bin/bwrap" ()
-      @@ dev_packages ()
+  let t =
+    match D.bubblewrap_version distro with
+    | Some version when version >= bubblewrap_minimum ->
+        dev_packages ~extra:"bubblewrap" ()
+    | _ ->
+        copy ~from:"0" ~src:[ "/usr/local/bin/bwrap" ] ~dst:"/usr/bin/bwrap" ()
+        @@ dev_packages ()
+  in
+  with_pkg_cache ?arch ~cache distro [ t ]
 
 let install_bubblewrap_wrappers =
   let strip = true in
@@ -334,11 +368,15 @@ let copy_opams_windows opam_branches =
     empty opam_branches
 
 (* Apk based Dockerfile *)
-let apk_opam2 ?(labels = []) ?arch ~opam_hashes distro () =
+let apk_opam2 ?(labels = []) ?arch ~cache ~opam_hashes distro () =
   let opam_master_hash, opam_branches = create_opam_branches opam_hashes in
   header ?arch distro
   @@ label (("distro_style", "apk") :: labels)
-  @@ Linux.Apk.install "build-base bzip2 git tar curl ca-certificates openssl"
+  @@ with_pkg_cache ?arch ~cache distro
+       [
+         Linux.Apk.install
+           "build-base bzip2 git tar curl ca-certificates openssl";
+       ]
   @@ Linux.Git.init ()
   @@ maybe_build_bubblewrap_from_source distro
   @@ install_opams opam_master_hash opam_branches
@@ -351,23 +389,24 @@ let apk_opam2 ?(labels = []) ?arch ~opam_hashes distro () =
            "https://dl-cdn.alpinelinux.org/alpine/edge/community" );
          (Some "testing", "https://dl-cdn.alpinelinux.org/alpine/edge/testing");
        ]
-  @@ bubblewrap_and_dev_packages distro
+  @@ bubblewrap_and_dev_packages ?arch ~cache distro
   @@ copy_opams ~src:"/usr/local/bin" ~dst:"/usr/bin" opam_branches
   @@ Linux.Apk.add_user ~uid:1000 ~gid:1000 ~sudo:true "opam"
   @@ install_bubblewrap_wrappers @@ Linux.Git.init ()
 
 (* Debian based Dockerfile *)
-let apt_opam2 ?(labels = []) ?arch distro ~opam_hashes () =
+let apt_opam2 ?(labels = []) ?arch ~cache distro ~opam_hashes () =
   let opam_master_hash, opam_branches = create_opam_branches opam_hashes in
   header ?arch distro
   @@ label (("distro_style", "apt") :: labels)
-  @@ Linux.Apt.install "build-essential curl git libcap-dev sudo"
+  @@ with_pkg_cache ?arch ~cache distro
+       [ Linux.Apt.install "build-essential curl git libcap-dev sudo" ]
   @@ Linux.Git.init ()
   @@ maybe_build_bubblewrap_from_source distro
   @@ install_opams opam_master_hash opam_branches
   @@ from ?arch distro
   @@ run "ln -fs /usr/share/zoneinfo/Europe/London /etc/localtime"
-  @@ bubblewrap_and_dev_packages distro
+  @@ bubblewrap_and_dev_packages ?arch ~cache distro
   @@ copy_opams ~src:"/usr/local/bin" ~dst:"/usr/bin" opam_branches
   @@ run
        "echo 'debconf debconf/frontend select Noninteractive' | \
@@ -387,29 +426,37 @@ let apt_opam2 ?(labels = []) ?arch distro ~opam_hashes () =
 
    [c_devtools_libs] is the name of the package group e.g. "C Development Tools and Libraries" on Fedora, or
    otherwise "Development Tools". *)
-let yum_opam2 ?(labels = []) ?arch ~yum_workaround ~enable_powertools
+let yum_opam2 ?(labels = []) ?arch ~cache ~yum_workaround ~enable_powertools
     ~dnf_version ~c_devtools_libs ~opam_hashes distro () =
   let opam_master_hash, opam_branches = create_opam_branches opam_hashes in
+  let clean = not cache in
   let workaround =
     if yum_workaround then
-      run "touch /var/lib/rpm/*" @@ Linux.RPM.install "yum-plugin-ovl"
+      run "touch /var/lib/rpm/*" @@ Linux.RPM.install ~clean "yum-plugin-ovl"
     else empty
   in
   header ?arch distro
   @@ label (("distro_style", "rpm") :: labels)
-  @@ run "yum --version || dnf install -y yum"
-  @@ workaround @@ Linux.RPM.update
-  @@ Linux.RPM.groupinstall dnf_version c_devtools_libs
-  @@ Linux.RPM.install
-       "git patch unzip which tar curl xz libcap-devel openssl sudo bzip2 gawk"
+  @@ with_pkg_cache ?arch ~cache distro
+       [
+         run "yum --version || dnf install -y yum"
+         @@ workaround @@ Linux.RPM.update
+         @@ Linux.RPM.groupinstall ~clean dnf_version c_devtools_libs
+         @@ Linux.RPM.install ~clean
+              "git patch unzip which tar curl xz libcap-devel openssl sudo \
+               bzip2 gawk";
+       ]
   @@ Linux.Git.init ()
   @@ maybe_build_bubblewrap_from_source distro
   @@ install_opams ~prefix:"/usr" opam_master_hash opam_branches
   @@ from ?arch distro
-  @@ run "yum --version || dnf install -y yum"
-  @@ workaround @@ Linux.RPM.update
-  @@ Linux.RPM.groupinstall dnf_version c_devtools_libs
-  @@ bubblewrap_and_dev_packages distro
+  @@ with_pkg_cache ?arch ~cache distro
+       [
+         run "yum --version || dnf install -y yum"
+         @@ workaround @@ Linux.RPM.update
+         @@ Linux.RPM.groupinstall ~clean dnf_version c_devtools_libs;
+       ]
+  @@ bubblewrap_and_dev_packages ?arch ~cache distro
   @@ copy_opams ~src:"/usr/bin" ~dst:"/usr/bin" opam_branches
   @@ (if enable_powertools then
         run "yum config-manager --set-enabled powertools" @@ Linux.RPM.update
@@ -421,32 +468,32 @@ let yum_opam2 ?(labels = []) ?arch ~yum_workaround ~enable_powertools
   @@ install_bubblewrap_wrappers @@ Linux.Git.init ()
 
 (* Zypper based Dockerfile *)
-let zypper_opam2 ?(labels = []) ?arch ~opam_hashes distro () =
+let zypper_opam2 ?(labels = []) ?arch ~cache ~opam_hashes distro () =
   let opam_master_hash, opam_branches = create_opam_branches opam_hashes in
   header ?arch distro
   @@ label (("distro_style", "zypper") :: labels)
-  @@ Linux.Zypper.dev_packages ()
+  @@ with_pkg_cache ?arch ~cache distro [ Linux.Zypper.dev_packages () ]
   @@ Linux.Git.init ()
   @@ maybe_build_bubblewrap_from_source distro
   @@ install_opams ~prefix:"/usr" opam_master_hash opam_branches
   @@ from ?arch distro
-  @@ bubblewrap_and_dev_packages distro
+  @@ bubblewrap_and_dev_packages ?arch ~cache distro
   @@ copy_opams ~src:"/usr/bin" ~dst:"/usr/bin" opam_branches
   @@ Linux.Zypper.add_user ~uid:1000 ~sudo:true "opam"
   @@ install_bubblewrap_wrappers @@ Linux.Git.init ()
 
 (* Pacman based Dockerfile *)
-let pacman_opam2 ?(labels = []) ?arch ~opam_hashes distro () =
+let pacman_opam2 ?(labels = []) ?arch ~cache ~opam_hashes distro () =
   let opam_master_hash, opam_branches = create_opam_branches opam_hashes in
   header ?arch distro
   @@ label (("distro_style", "pacman") :: labels)
-  @@ Linux.Pacman.dev_packages ()
+  @@ with_pkg_cache ?arch ~cache distro [ Linux.Pacman.dev_packages () ]
   @@ Linux.Git.init ()
   @@ maybe_build_bubblewrap_from_source distro
   @@ install_opams opam_master_hash opam_branches
   @@ run "strip /usr/local/bin/opam*"
   @@ from ?arch distro
-  @@ bubblewrap_and_dev_packages distro
+  @@ bubblewrap_and_dev_packages ?arch ~cache distro
   @@ copy_opams ~src:"/usr/local/bin" ~dst:"/usr/bin" opam_branches
   @@ Linux.Pacman.add_user ~uid:1000 ~sudo:true "opam"
   @@ install_bubblewrap_wrappers @@ Linux.Git.init ()
@@ -464,8 +511,8 @@ let aslr_state = function
   | _ -> assert false
 
 (* Native Windows with mingw-w64 and WinGet. *)
-let windows_mingw_opam2 ?(labels = []) ~override_tag ~opam_hashes (distro : D.t)
-    () =
+let windows_mingw_opam2 ?(labels = []) ~override_tag ~opam_hashes ~cache:_
+    (distro : D.t) () =
   let opam_master_hash, opam_branches =
     create_opam_branches_windows opam_hashes
   in
@@ -505,8 +552,8 @@ let windows_mingw_opam2 ?(labels = []) ~override_tag ~opam_hashes (distro : D.t)
   @@ Windows.Cygwin.setup () @@ Windows.Cygwin.Git.init ()
 
 (* Native Windows with MSVC and WinGet. *)
-let windows_msvc_opam2 ?(labels = []) ~override_tag ~opam_hashes (distro : D.t)
-    () =
+let windows_msvc_opam2 ?(labels = []) ~override_tag ~opam_hashes ~cache:_
+    (distro : D.t) () =
   let opam_master_hash, opam_branches =
     create_opam_branches_windows opam_hashes
   in
@@ -548,7 +595,7 @@ let windows_msvc_opam2 ?(labels = []) ~override_tag ~opam_hashes (distro : D.t)
   @@ Windows.Cygwin.setup () @@ Windows.Cygwin.Git.init ()
 
 let gen_opam2_distro ?override_tag ?(clone_opam_repo = true) ?arch ?labels
-    ~opam_hashes d =
+    ?(cache = true) ~opam_hashes d =
   let fn =
     match D.package_manager d with
     | `Apk -> apk_opam2 ?labels ?arch ~opam_hashes d ()
@@ -598,7 +645,7 @@ let gen_opam2_distro ?override_tag ?(clone_opam_repo = true) ?arch ?labels
     | None -> empty
     | Some pers -> entrypoint_exec [ pers ]
   in
-  (D.tag_of_distro d, fn @@ clone @@ pers)
+  (D.tag_of_distro d, fn ~cache @@ clone @@ pers)
 
 let ocaml_depexts distro v =
   let open Linux in
