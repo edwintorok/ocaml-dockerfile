@@ -399,6 +399,14 @@ let maintainer fmt = ksprintf (fun m -> [ `Maintainer m ]) fmt
 let run ?(mounts = []) ?network ?security fmt =
   ksprintf (fun b -> [ `Run (mounts, network, security, `Shell b) ]) fmt
 
+let prefix_mounts prefix = function
+  | `Run (mounts, network, security, s) ->
+      `Run (prefix @ mounts, network, security, s)
+  | other -> other
+
+let with_mounts prefix dockerfiles =
+  dockerfiles |> List.concat |> crunch |> List.map (prefix_mounts prefix)
+
 let run_exec ?(mounts = []) ?network ?security cmds : t =
   [ `Run (mounts, network, security, `Exec cmds) ]
 
